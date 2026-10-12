@@ -1,0 +1,272 @@
+<!doctype html><html><head><meta charset="utf-8"><title>KartMania Prototype</title>
+<style>body{margin:0;overflow:hidden;background:#0a0f2c;font:14px system-ui;color:#fff}
+#hud{position:fixed;top:10px;left:12px;line-height:1.5;text-shadow:0 1px 3px #000;white-space:pre}
+#hud b{font-size:28px;color:#ff6a00}#help{position:fixed;bottom:10px;left:12px;opacity:.75;font-size:12px;white-space:pre}</style></head><body>
+<img id="ref" src="track.png" style="position:fixed;display:none;opacity:.7;pointer-events:none;z-index:0">
+<canvas id="mini" width="230" height="230" style="position:fixed;right:12px;bottom:12px;z-index:2;border-radius:10px;background:rgba(10,15,44,.8);border:1px solid #ff6a0088"></canvas>
+<div id="hud" style="z-index:2"></div><div id="help" style="z-index:2"></div>
+<script type="importmap">{"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js"}}</script>
+<script type="module">
+import * as THREE from 'three';
+
+/* ---------- CONFIG ---------- */
+const S = 0.27;         // metres per image pixel; traced loop is ~2237px, so 0.27 gives ~600m
+const W = 8;            // track width (m)
+const N = 800;          // samples along centreline
+const VMAX = 18;        // 65 km/h
+const KEY = 'km_pts_v1';
+// Centreline control points in IMAGE PIXELS (500x500 map). First point = finish line, driving order.
+const DEFAULT = [[148,329],[168,330,3.3,6.3],[180,248],[215,205,4.5,null],[248,202,5.4,5.3],[269,234,null,4],[271,275,4.6,null],[271,319,4.5,null],[264,345,6.4,null],[242,330],[238,293],[230,273,5,null],[208,285,null,4.6],[207,329,null,4.4],[221,384,null,7.3],[271,393,4.4,5.9],[335,373,null,5.8],[381,334,4.6,4.8],[433,296,null,5.3],[459,268,4.7,4.8],[472,237,null,5.6],[458,205,4.7,5.8],[432,193,5.9,4.6],[400,200,5.4,null],[383,228,6,null],[367,266],[355,296,4.3,null],[328,308,4.7,4.4],[310,284,4.4,4.5],[312,250,4.4,null],[321,209,null,4.8],[337,181,null,4.6],[369,156,null,4.3],[398,132,null,5.2],[420,101,7.3,9.1],[413,77,7,9.3],[381,68,5.6,4.8],[333,65],[289,65],[254,70,5.8,4.9],[250,95,7,4.8],[279,110],[308,111,5.2,null],[313,131],[296,151,3.4,null],[263,161],[210,162,4.9,null],[153,161],[89,162],[53,169,6.4,null],[41,193,7.2,6.1],[54,211,6.9,6.2],[88,201,5.9,4],[124,206,null,4.3],[132,235],[115,264],[92,286,5.5,null],[82,320,null,6.2]];
+let pts = JSON.parse(localStorage.getItem(KEY) || 'null') || DEFAULT.map(p => [...p]);
+
+/* ---------- SCENE ---------- */
+const renderer = new THREE.WebGLRenderer({antialias:true, alpha:true});
+renderer.setPixelRatio(devicePixelRatio); renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+Object.assign(renderer.domElement.style, {position:'fixed', left:0, top:0, zIndex:1});
+const scene = new THREE.Scene(); scene.background = new THREE.Color(0x0a0f2c);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x223, 0.9));
+const sun = new THREE.DirectionalLight(0xffffff, 0.8); sun.position.set(50, 100, 30); scene.add(sun);
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(1000, 1000), new THREE.MeshLambertMaterial({color:0x0c1236}));
+ground.rotation.x = -Math.PI/2; ground.position.y = -0.02; scene.add(ground);
+
+const chase = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.1, 1000);
+const ortho = new THREE.OrthographicCamera();
+let cam = chase, editMode = false;
+function setOrtho(){
+  const h = 500*S*0.57, w = h*innerWidth/innerHeight;
+  Object.assign(ortho,{left:-w,right:w,top:h,bottom:-h,near:0.1,far:500});
+  ortho.position.set(250*S, 100, 250*S); ortho.up.set(0,0,-1); ortho.lookAt(250*S, 0, 250*S); ortho.updateProjectionMatrix();
+}
+setOrtho();
+
+/* ---------- REFERENCE IMAGE + MINIMAP ----------
+   track.png (square 500x500 map, next to this file) is shown as a DOM <img> behind the
+   transparent canvas in edit mode, and as the minimap backdrop. Works from file:// (no server needed). */
+const ref = document.getElementById('ref'), mini = document.getElementById('mini'), mctx = mini.getContext('2d');
+let refOK = true, showImg = true, editMode0 = false;
+ref.onerror = () => { refOK = false; ref.style.display = 'none'; };
+function layoutRef(){
+  const k = innerHeight/(2*500*S*0.57), w = 500*S*k;   // matches ortho camera height
+  Object.assign(ref.style, {width:w+'px', height:w+'px', left:(innerWidth/2 - w/2)+'px', top:(innerHeight/2 - w/2)+'px'});
+}
+function setEdit(){
+  scene.background = editMode ? null : new THREE.Color(0x0a0f2c); ground.visible = !editMode;
+  ref.style.display = editMode && showImg && refOK ? 'block' : 'none'; layoutRef();
+  mini.style.display = editMode ? 'none' : 'block';
+  group.traverse(o => { if(o.material){ o.material.transparent = editMode; o.material.opacity = editMode ? 0.4 : 1; o.material.needsUpdate = true; } });
+}
+function drawMini(){
+  const c = mctx, M = mini.width, sc = M/(500*S);
+  c.clearRect(0,0,M,M);
+  if(showImg && refOK && ref.complete && ref.naturalWidth){ c.globalAlpha = 0.6; c.drawImage(ref,0,0,M,M); c.globalAlpha = 1; }
+  c.beginPath(); samples.forEach((p,i) => i ? c.lineTo(p.x*sc, p.z*sc) : c.moveTo(p.x*sc, p.z*sc)); c.closePath();
+  c.lineJoin = 'round'; c.strokeStyle = 'rgba(255,230,0,.35)'; c.lineWidth = W*sc; c.stroke();
+  c.strokeStyle = '#ffe600'; c.lineWidth = 1; c.stroke();
+  c.fillStyle = '#fff'; c.fillRect(samples[0].x*sc-3, samples[0].z*sc-3, 6, 6);          // finish line
+  c.save(); c.translate(pos.x*sc, pos.z*sc); c.rotate(Math.atan2(Math.cos(heading), Math.sin(heading)));
+  c.fillStyle = '#ff3355'; c.beginPath(); c.moveTo(8,0); c.lineTo(-5,5); c.lineTo(-5,-5); c.closePath(); c.fill(); c.restore();
+}
+
+/* ---------- TRACK BUILD ---------- */
+let group = new THREE.Group(), handles = new THREE.Group(), samples = [], tang = [], nrm = [], halfL = [], halfR = [], curveRef = null, wInfo = [];
+scene.add(group, handles);
+function mesh(pos, idx, color){
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(pos,3));
+  g.setIndex(idx); g.computeVertexNormals();
+  return new THREE.Mesh(g, new THREE.MeshLambertMaterial({color, side:THREE.DoubleSide}));
+}
+function strip(pos, color){ const idx=[]; for(let i=0;i<N;i++){const j=(i+1)%N,p=2*i,q=2*j; idx.push(p,q,p+1,p+1,q,q+1);} return mesh(pos, idx, color); }
+function buildHandles(){
+  handles.clear();
+  pts.forEach((p,i) => { const s = new THREE.Mesh(new THREE.SphereGeometry(1.3,12,8), new THREE.MeshBasicMaterial({color: i===0?0x00ff88:0xff3355}));
+    s.position.set(p[0]*S,0.6,p[1]*S); handles.add(s); });
+  wInfo = [];   // cyan edge-width handles, one pair per control point
+  if(pts.length >= 4 && curveRef) pts.forEach((p,i) => {
+    const t = curveRef.getTangent(i/pts.length).setY(0).normalize(), n = new THREE.Vector3(-t.z,0,t.x), c = new THREE.Vector3(p[0]*S,0,p[1]*S);
+    [[1,p[2] ?? W/2],[-1,p[3] ?? W/2]].forEach(([sg,w]) => {
+      const m = new THREE.Mesh(new THREE.SphereGeometry(0.9,10,8), new THREE.MeshBasicMaterial({color:0x22d3ee}));
+      m.position.copy(c).addScaledVector(n, sg*w).setY(0.6); handles.add(m); wInfo.push({i, sg, c, n});
+    });
+  });
+  handles.visible = editMode;
+}
+function build(){
+  group.traverse(o => o.geometry && o.geometry.dispose()); scene.remove(group); group = new THREE.Group(); scene.add(group);
+  while(pts.length > 4 && Math.hypot(pts[0][0]-pts[pts.length-1][0], pts[0][1]-pts[pts.length-1][1]) < 1) pts.pop();   // drop a closing duplicate of the start point
+  if(pts.length < 4){ buildHandles(); setEdit(); return; }
+  const curve = new THREE.CatmullRomCurve3(pts.map(p => new THREE.Vector3(p[0]*S,0,p[1]*S)), true, 'centripetal');
+  samples = curve.getSpacedPoints(N).slice(0,N); curveRef = curve;
+  tang = samples.map((_,i) => samples[(i+1)%N].clone().sub(samples[(i-1+N)%N]).normalize());
+  nrm = tang.map(t => new THREE.Vector3(-t.z,0,t.x));
+  // Curvature-limited edges: on the inside of tight corners the offset curve would fold over itself,
+  // so narrow the track there (radius check, min-filtered then blurred so the pinch is smooth).
+  const ds = curve.getLength()/N, nc = pts.length;
+  // per-point half-widths (pts[i][2] = left, pts[i][3] = right, metres) blended smoothly along the spline
+  const widthAt = (j, c) => { const pp = curve.getUtoTmapping(j/N)*nc, fl = Math.floor(pp), a = fl % nc, b = (a+1) % nc, fr = pp - fl, sm = fr*fr*(3-2*fr);
+    const wa = pts[a][c] ?? W/2, wb = pts[b][c] ?? W/2; return wa + (wb - wa)*sm; };
+  const kap = samples.map((_,i) => tang[(i+1)%N].clone().sub(tang[(i-1+N)%N]).dot(nrm[i])/(2*ds));
+  const halfW = sgn => {
+    const wA = samples.map((_,j) => widthAt(j, sgn > 0 ? 2 : 3));
+    const raw = kap.map((k,i) => sgn*k > 0 ? Math.max(1.5, Math.min(wA[i], 0.8/Math.abs(k))) : wA[i]), w = 8;
+    const mn = raw.map((_,i) => { let m = 1e9; for(let j=-w;j<=w;j++) m = Math.min(m, raw[(i+j+N)%N]); return m; });
+    return mn.map((_,i) => { let t = 0; for(let j=-w;j<=w;j++) t += mn[(i+j+N)%N]; return t/(2*w+1); });
+  };
+  halfL = halfW(1); halfR = halfW(-1);
+  const L = samples.map((p,i) => p.clone().addScaledVector(nrm[i], halfL[i]));
+  const R = samples.map((p,i) => p.clone().addScaledVector(nrm[i], -halfR[i]));
+  const road=[], wl=[], wr=[];
+  for(let i=0;i<N;i++){ road.push(L[i].x,0,L[i].z,R[i].x,0,R[i].z);
+    wl.push(L[i].x,0,L[i].z,L[i].x,0.7,L[i].z); wr.push(R[i].x,0,R[i].z,R[i].x,0.7,R[i].z); }
+  group.add(strip(road,0x262a38), strip(wl,0xffe600), strip(wr,0xffe600));
+  // finish line
+  const fl = new THREE.Mesh(new THREE.BoxGeometry(W,0.02,1.2), new THREE.MeshBasicMaterial({color:0xffffff}));
+  fl.position.copy(samples[0]).setY(0.03); fl.rotation.y = Math.atan2(tang[0].x, tang[0].z);
+  group.add(fl);
+  buildHandles(); setEdit();
+}
+
+/* ---------- KART ---------- */
+const kart = new THREE.Group();   // open-wheel F1-style car (papaya orange + blue, generic livery, faces +z)
+const PAPAYA = 0xff6a00, BLUE = 0x0a0a0c, DARK = 0x15171c, GREY = 0x8a8f99;
+function part(geo, color, x, y, z, rx = 0, ry = 0, rz = 0){
+  const m = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({color}));
+  m.position.set(x, y, z); m.rotation.set(rx, ry, rz); kart.add(m); return m;
+}
+const B = (w,h,d) => new THREE.BoxGeometry(w,h,d);
+// floor, monocoque, nose cone, sidepods, engine cover, airbox
+part(B(1.3,0.05,3.1), DARK, 0, 0.12, 0.1);
+part(B(0.55,0.34,1.9), PAPAYA, 0, 0.38, 0.45);
+part(new THREE.CylinderGeometry(0.07,0.26,1.3,14), PAPAYA, 0, 0.32, 2.0, Math.PI/2);
+[-1,1].forEach(sx => part(B(0.42,0.3,1.35), PAPAYA, sx*0.48, 0.3, -0.35));
+part(B(0.4,0.34,1.5), PAPAYA, 0, 0.45, -1.15);
+part(B(0.3,0.32,0.45), BLUE, 0, 0.78, -0.15);                 // airbox
+part(B(0.16,0.012,1.5), BLUE, 0, 0.56, 1.45);                  // nose stripe
+// driver, halo
+part(new THREE.SphereGeometry(0.17,14,10), 0xeeeeee, 0, 0.66, 0.25);
+part(B(0.3,0.06,0.2), BLUE, 0, 0.66, 0.34);
+part(new THREE.TorusGeometry(0.22,0.025,6,14,Math.PI), DARK, 0, 0.5, 0.5);
+// front wing + endplates
+part(B(1.6,0.05,0.45), PAPAYA, 0, 0.1, 2.55);
+part(B(1.4,0.04,0.3), DARK, 0, 0.2, 2.45);
+[-1,1].forEach(sx => part(B(0.04,0.2,0.55), BLUE, sx*0.8, 0.17, 2.55));
+// rear wing + endplates + support
+part(B(1.05,0.05,0.4), PAPAYA, 0, 0.98, -1.85);
+part(B(1.05,0.04,0.28), DARK, 0, 1.12, -1.85);
+[-1,1].forEach(sx => part(B(0.04,0.5,0.6), BLUE, sx*0.54, 0.98, -1.85));
+part(B(0.1,0.55,0.3), DARK, 0, 0.68, -1.65);
+// wheels (front smaller/narrower, rear larger/wider) + suspension arms
+[[1.35,0.33,0.36],[-1.25,0.37,0.5]].forEach(([z,r,w]) => [-1,1].forEach(sx => {
+  part(new THREE.CylinderGeometry(r,r,w,18), 0x0d0d0f, sx*0.88, r, z, 0, 0, Math.PI/2);
+  part(new THREE.CylinderGeometry(r*0.6,r*0.6,w+0.02,14), GREY, sx*0.88, r, z, 0, 0, Math.PI/2);
+  part(B(0.55,0.04,0.05), DARK, sx*0.58, r+0.06, z);
+}));
+kart.scale.setScalar(0.8);   // car size relative to track
+scene.add(kart);
+const pos = new THREE.Vector3(); let heading = 0, speed = 0, idx = 0, lapStart = 0, lap = 0, best = null, last = null, half = false, t0 = 0;
+function reset(){
+  pos.copy(samples[0]); heading = Math.atan2(tang[0].x, tang[0].z); speed = 0; vx = vz = 0; idx = 0; half = false; lapStart = performance.now()/1000; lap = 0;
+}
+
+/* ---------- INPUT ---------- */
+const keys = {}; let tracing = false;
+addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if(e.code === 'KeyT'){   // trace a new centreline: click points in driving order, first = finish line
+    if(tracing){ if(pts.length >= 4){ tracing = false; localStorage.setItem(KEY, JSON.stringify(pts)); } }
+    else { tracing = true; pts = []; if(!editMode){ editMode = true; cam = ortho; } build(); }
+  }
+  if(e.code === 'Backspace' && tracing){ pts.pop(); build(); }
+  if(e.code === 'KeyE' && !(tracing && pts.length < 4)){ tracing = false; editMode = !editMode; cam = editMode ? ortho : chase; handles.visible = editMode; setEdit(); if(!editMode){ localStorage.setItem(KEY, JSON.stringify(pts)); reset(); } }
+  if(e.code === 'KeyR') reset();
+  if(e.code === 'KeyO'){ showImg = !showImg; setEdit(); }
+  if(e.code === 'KeyC'){ const s = JSON.stringify(pts.map(p => p.map((v,i) => v == null ? null : i < 2 ? Math.round(v) : Math.round(v*10)/10))); console.log(s); navigator.clipboard && navigator.clipboard.writeText(s); }
+  if(e.code === 'KeyZ'){ pts = DEFAULT.map(p => [...p]); localStorage.removeItem(KEY); build(); reset(); }
+});
+addEventListener('keyup', e => keys[e.code] = false);
+
+/* ---------- EDITOR (E): drag points, Shift+click adds, Alt+click deletes ---------- */
+const ray = new THREE.Raycaster(), gp = new THREE.Plane(new THREE.Vector3(0,1,0),0), ndc = new THREE.Vector2();
+const ground2 = e => { ndc.set(e.clientX/innerWidth*2-1, -(e.clientY/innerHeight)*2+1); ray.setFromCamera(ndc, cam); const v = new THREE.Vector3(); return ray.ray.intersectPlane(gp, v) ? [v.x/S, v.z/S] : null; };
+const segD = (p,a,b) => { const x=b[0]-a[0], y=b[1]-a[1]; let t=((p[0]-a[0])*x+(p[1]-a[1])*y)/(x*x+y*y||1); t=Math.max(0,Math.min(1,t)); return Math.hypot(p[0]-a[0]-t*x, p[1]-a[1]-t*y); };
+let drag = -1, dragW = null;
+renderer.domElement.addEventListener('pointerdown', e => {
+  if(!editMode) return; const p = ground2(e); if(!p) return;
+  if(tracing){ pts.push(p); build(); return; }
+  const pw = [p[0]*S, p[1]*S];   // width handles first
+  const wh = wInfo.find(h => { const w = pts[h.i][h.sg > 0 ? 2 : 3] ?? W/2; return Math.hypot(pw[0] - (h.c.x + h.n.x*h.sg*w), pw[1] - (h.c.z + h.n.z*h.sg*w)) < 1.4; });
+  if(wh){ dragW = wh; return; }
+  let hi = -1, hd = 8; pts.forEach((q,i) => { const d = Math.hypot(q[0]-p[0], q[1]-p[1]); if(d < hd){ hd = d; hi = i; } });
+  if(e.altKey && hi >= 0 && pts.length > 4){ pts.splice(hi,1); build(); }
+  else if(e.shiftKey){ let bi = 0, bd = 1e9; pts.forEach((q,i) => { const d = segD(p, q, pts[(i+1)%pts.length]); if(d < bd){ bd = d; bi = i; } }); pts.splice(bi+1, 0, [p[0], p[1], pts[bi][2], pts[bi][3]]); build(); drag = bi+1; }
+  else drag = hi;
+});
+addEventListener('pointermove', e => {
+  if(dragW){ const p = ground2(e); if(p){ const h = dragW, d = ((p[0]*S - h.c.x)*h.n.x + (p[1]*S - h.c.z)*h.n.z)*h.sg, q = pts[h.i];
+    while(q.length < 4) q.push(null); q[h.sg > 0 ? 2 : 3] = Math.max(1.5, Math.min(12, d)); build(); } return; }
+  if(drag < 0) return; const p = ground2(e); if(p){ pts[drag] = [p[0], p[1], ...pts[drag].slice(2)]; build(); } });
+addEventListener('pointerup', () => { if(dragW){ dragW = null; localStorage.setItem(KEY, JSON.stringify(pts)); } if(drag >= 0){ drag = -1; localStorage.setItem(KEY, JSON.stringify(pts)); } });
+
+/* ---------- LOOP ---------- */
+const hud = document.getElementById('hud'), help = document.getElementById('help');
+const fmt = t => t == null ? '--' : t.toFixed(2) + 's';
+/* Gamepad (standard mapping): RT/A throttle, LT/B brake-reverse, left stick or d-pad steer, Y reset */
+let padY = false;
+function readPad(){
+  const g = [...(navigator.getGamepads ? navigator.getGamepads() : [])].find(p => p && p.connected);
+  if(!g) return null;
+  const b = i => g.buttons[i] ? g.buttons[i].value : 0, ax = Math.abs(g.axes[0]) < 0.1 ? 0 : g.axes[0];
+  return { thr: Math.max(b(7), b(0)), brk: Math.max(b(6), b(1)), steer: -ax || (b(14) - b(15)), y: b(3) > 0.5, hb: b(5) > 0.5 || b(2) > 0.5 };
+}
+let vx = 0, vz = 0, drifting = false;
+function step(dt){
+  const up = keys.ArrowUp || keys.KeyW, dn = keys.ArrowDown || keys.KeyS, lf = keys.ArrowLeft || keys.KeyA, rt = keys.ArrowRight || keys.KeyD;
+  const pd = readPad();
+  if(pd){ if(pd.y && !padY) reset(); padY = pd.y; }
+  const thr = Math.max(up ? 1 : 0, pd ? pd.thr : 0), brk = Math.max(dn ? 1 : 0, pd ? pd.brk : 0);
+  const steer = Math.max(-1, Math.min(1, ((lf ? 1 : 0) - (rt ? 1 : 0)) + (pd ? pd.steer : 0)));
+  const hb = keys.Space || (pd && pd.hb);
+  // world-space velocity (vx,vz) lets the car slide: heading can differ from travel direction
+  let fx = Math.sin(heading), fz = Math.cos(heading);
+  drifting = Math.abs(steer) > 0.25 && Math.hypot(vx, vz) > 9 && (brk > 0.3 || hb);   // brake/handbrake + steer at speed
+  speed = vx*fx + vz*fz; const s0 = speed;                                              // forward component
+  speed += (thr > 0.05 ? 9*thr : brk > 0.05 ? (speed > 0 ? -16 : -6)*brk*(drifting ? 0.35 : 1) : 0) * dt;
+  speed -= speed * 0.35 * dt; if(thr <= 0.05 && brk <= 0.05) speed -= Math.sign(speed) * Math.min(Math.abs(speed), 2*dt);
+  speed = Math.max(-5, Math.min(VMAX, speed));
+  vx += fx*(speed - s0); vz += fz*(speed - s0);
+  // steering: strong at low speed (tight turn-in), softer at high speed, extra rotation while drifting
+  const spd = Math.hypot(vx, vz);
+  heading += steer * Math.min(1, spd/1.2) * Math.sign(speed) * 1.9 * dt * (1 - 0.45*spd/VMAX) * (1 + 0.8*Math.max(0, 1 - spd/6)) * (drifting ? 1.6 : 1);
+  // tyre grip: pull velocity direction toward heading (high grip normally, low while drifting)
+  fx = Math.sin(heading); fz = Math.cos(heading);
+  const sg = (vx*fx + vz*fz) < 0 ? -1 : 1, mag = Math.hypot(vx, vz), k = 1 - Math.exp(-(drifting ? 1.0 : 7)*dt);
+  vx += (fx*sg*mag - vx)*k; vz += (fz*sg*mag - vz)*k;
+  if(drifting){ vx *= 1 - 0.2*dt; vz *= 1 - 0.2*dt; }
+  speed = vx*fx + vz*fz;
+  pos.x += vx*dt; pos.z += vz*dt;
+  // nearest centreline sample (local window)
+  let bi = idx, bd = 1e9;
+  for(let k = -40; k <= 40; k++){ const i = (idx+k+N)%N, d = pos.distanceToSquared(samples[i]); if(d < bd){ bd = d; bi = i; } }
+  const prev = idx; idx = bi;
+  const lat = pos.clone().sub(samples[idx]).dot(nrm[idx]), lim = (lat > 0 ? halfL[idx] : halfR[idx]) - 0.9;
+  if(Math.abs(lat) > lim){ pos.addScaledVector(nrm[idx], -(Math.abs(lat)-lim)*Math.sign(lat)); vx *= 1 - 2.5*dt; vz *= 1 - 2.5*dt; }
+  if(idx > N*0.4 && idx < N*0.6) half = true;
+  if(prev > N*0.85 && idx < N*0.15 && half){ const now = performance.now()/1000; last = now - lapStart; lapStart = now; if(best == null || last < best) best = last; lap++; half = false; }
+}
+function frame(now){
+  const dt = Math.min(0.05, (now - t0)/1000 || 0.016); t0 = now;
+  if(!editMode) step(dt);
+  kart.position.copy(pos); kart.rotation.y = heading;
+  if(!editMode){
+    const f = new THREE.Vector3(Math.sin(heading),0,Math.cos(heading));
+    chase.position.lerp(pos.clone().addScaledVector(f,-7.5).setY(3.2), Math.min(1, dt*5));
+    chase.lookAt(pos.clone().addScaledVector(f,4).setY(0.5));
+  }
+  hud.innerHTML = `<b>${Math.round(Math.hypot(vx,vz)*3.6)}</b> km/h${drifting ? '  DRIFT' : ''}\nLap ${lap+1}  ${fmt(performance.now()/1000-lapStart)}\nLast ${fmt(last)}  Best ${fmt(best)}\nTrack length ~${Math.round(new THREE.CatmullRomCurve3(samples,true).getLength())} m`;
+  help.textContent = tracing ? 'TRACE: click the track centre in driving order, starting at the finish line | Backspace undo | T finish (min 4) | ' + pts.length + ' pts' : editMode ? 'EDIT: drag red dots (centre) / cyan dots (edge width) | Shift+click add | Alt+click delete | O toggle image | C copy points | T retrace from scratch | E exit & save | Z reset' : 'WASD / arrows or gamepad (RT/LT, left stick, Y reset) | brake + steer at speed, Space or X/RB = drift | R reset | E edit track';
+  if(!editMode) drawMini();
+  renderer.render(scene, cam); requestAnimationFrame(frame);
+}
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); chase.aspect = innerWidth/innerHeight; chase.updateProjectionMatrix(); setOrtho(); layoutRef(); });
+build(); reset(); chase.position.copy(pos).add(new THREE.Vector3(0,3,-7)); requestAnimationFrame(frame);
+</script></body></html>
