@@ -289,5 +289,12 @@ function frame(now){
   renderer.render(scene, cam); requestAnimationFrame(frame);
 }
 addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); chase.aspect = innerWidth/innerHeight; chase.updateProjectionMatrix(); setOrtho(); layoutRef(); });
+  
 build(); reset(); chase.position.copy(pos).add(new THREE.Vector3(0,3,-7)); requestAnimationFrame(frame);
+  (function checkMobile(){
+  const ua = navigator.userAgent, ipadOS = /Macintosh/.test(ua) && navigator.maxTouchPoints > 1;
+  const mobile = (navigator.userAgentData && navigator.userAgentData.mobile)
+    || /Android|iPhone|iPad|iPod|Mobi/i.test(ua) || ipadOS || matchMedia('(pointer: coarse)').matches;
+  if(mobile) alert('use laptop, need keyboard or controller');
+})();
 </script></body></html>
